@@ -39,7 +39,13 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://jaeminbag12.shinyapps.io"],
+    allow_origins=[
+        "https://jaeminbag12.shinyapps.io",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000"
+    ],
     allow_credentials=False,
     allow_methods=["POST","GET","OPTIONS"],
     allow_headers=["*"],
