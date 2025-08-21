@@ -16,9 +16,20 @@ from langchain_core.output_parsers import StrOutputParser
 # -----------------------------
 # 키 로드 (예: api_key.txt)
 # -----------------------------
-with open("api_key.txt") as f:
-    OPENAI_API_KEY = f.read().strip()
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # 로컬 개발 환경이면 .env 파일에서 읽어옴
+except ImportError:
+    pass
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError(
+        "OPENAI_API_KEY가 설정되어 있지 않습니다. "
+        "로컬 개발 시 .env 파일에 OPENAI_API_KEY=sk-... 형태로 추가하거나, "
+        "배포 환경(Render 등)에서는 Environment Variable로 등록하세요."
+    )
 
 
 # -----------------------------
@@ -28,12 +39,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["https://jaeminbag12.shinyapps.io"],
+    allow_credentials=False,
+    allow_methods=["POST","GET","OPTIONS"],
     allow_headers=["*"],
 )
-
 
 # -----------------------------
 # LLM & 체인 준비
