@@ -27,17 +27,24 @@ except Exception:
 # =============================
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # .env 로컬 개발 환경
+    load_dotenv()
 except ImportError:
     pass
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# 없으면 api_key.txt에서 읽어오기
+if not OPENAI_API_KEY and os.path.exists("api_key.txt"):
+    with open("api_key.txt", "r", encoding="utf-8") as f:
+        OPENAI_API_KEY = f.read().strip()
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY   # 이후에도 환경변수처럼 접근 가능
+
 if not OPENAI_API_KEY:
     raise RuntimeError(
         "OPENAI_API_KEY가 설정되어 있지 않습니다. "
-        "로컬 개발 시 .env 에 OPENAI_API_KEY=sk-... 추가하거나, "
-        "배포 환경(Render 등)에서는 Environment Variable로 등록하세요."
+        "api_key.txt 파일을 만들거나, .env/환경변수에 추가하세요."
     )
+
 
 # =============================
 # 2) FastAPI
@@ -52,6 +59,10 @@ app.add_middleware(
         "http://localhost:8000",
         "http://127.0.0.1:3000",
         "http://localhost:3000",
+        "http://127.0.0.1:3838",   # Shiny 로컬 (RStudio 기본 포트)
+        "http://localhost:3838",
+        "http://127.0.0.1:7173",   # Shiny 로컬 (RStudio 기본 포트)
+        "http://localhost:7173",
     ],
     allow_credentials=False,
     allow_methods=["POST", "GET", "OPTIONS"],
