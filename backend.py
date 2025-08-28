@@ -1,3 +1,6 @@
+## Note : 서버 열기
+uvicorn backend:app --reload --port 8000 --host 127.0.0.1
+
 # backend.py
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware

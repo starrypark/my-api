@@ -5,3 +5,7 @@ langchain-openai>=0.3
 langchain-core>=0.3
 openai>=1.0
 python-multipart
+pypdf
+Pillow
+python-dotenv
+python-magic
