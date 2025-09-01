@@ -75,7 +75,7 @@ app.add_middleware(
 # =============================
 # 3) LLM & 체인
 # =============================
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-5", temperature=0)
 
 DEFAULT_SYSTEM = "You are a helpful assistant. Keep answers concise and accurate."
 
