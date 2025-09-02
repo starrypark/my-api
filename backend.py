@@ -4,9 +4,9 @@
 # backend.py
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import Optional, Dict, AsyncGenerator
+from typing import Optional, Dict
 import os
 import io
 from uuid import uuid4
@@ -75,7 +75,7 @@ app.add_middleware(
 # =============================
 # 3) LLM & 체인
 # =============================
-llm = ChatOpenAI(model="gpt-5", temperature=0)
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 DEFAULT_SYSTEM = "You are a helpful assistant. Keep answers concise and accurate."
 
@@ -223,47 +223,6 @@ def chat(body: ChatIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================
-# 9) 스트리밍 대화 (/chat_stream)
-# =============================
-@app.post("/chat_stream")
-async def chat_stream(body: ChatIn):
-    """
-    chunked text 스트리밍. Content-Type: text/plain
-    """
-    if os.environ.get("OPENAI_API_KEY", "") == "":
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY가 설정되어 있지 않습니다. PowerShell: $env:OPENAI_API_KEY=\"...\""
-        )
-
-    session_id = body.session_id or "default"
-    system_prompt = body.system_prompt or DEFAULT_SYSTEM
-
-    # 업로드 파일 컨텍스트 주입
-    file_context = ""
-    if body.file_id:
-        rec = _FILE_STORE.get(body.file_id)
-        if not rec:
-            raise HTTPException(status_code=400, detail="유효하지 않은 file_id 입니다.")
-        if rec["content_type"] == "application/pdf" and rec.get("text"):
-            snippet = rec["text"][:6000]
-            file_context = f"\n\n[Attached PDF excerpt]\n{snippet}\n"
-        elif rec["bytes"] is not None:
-            file_context = f"\n\n[Attached image: {rec['filename']} ({rec['content_type']}, {rec['size']} bytes)]"
-
-    async def token_generator() -> AsyncGenerator[bytes, None]:
-        try:
-            async for chunk in chain_with_memory.astream(
-                {"question": body.question + file_context, "system_prompt": system_prompt},
-                config={"configurable": {"session_id": session_id}},
-            ):
-                yield (chunk).encode("utf-8")
-        except Exception as e:
-            yield f"\n[STREAM ERROR] {str(e)}".encode("utf-8")
-
-    return StreamingResponse(token_generator(), media_type="text/plain; charset=utf-8")
-
-# =============================
 # 10) 이미지 분석 (멀티모달) 예시 엔드포인트
 # =============================
 @app.post("/analyze_image")
@@ -325,7 +284,7 @@ def home():
 <title>FastAPI Chat</title>
 </head>
 <body style="font-family:sans-serif; max-width:820px; margin:40px auto;">
-<h2>FastAPI Chat (Memory + Stream + Upload)</h2>
+<h2>FastAPI Chat (Memory + Upload)</h2>
 
 <div style="margin:8px 0">
   <input id="sid" placeholder="session_id (e.g., user1)" style="width:49%">
@@ -342,8 +301,7 @@ def home():
 <textarea id="q" rows="3" style="width:100%; margin-top:10px;" placeholder="질문"></textarea>
 
 <div style="margin-top:8px; display:flex; gap:8px; flex-wrap: wrap;">
-  <button id="btn">Send (non-stream)</button>
-  <button id="btnStream">Send (stream)</button>
+  <button id="btn">Send</button>
   <button id="reset">Reset Memory</button>
   <button id="analyzeImage">Analyze Image</button>
 </div>
@@ -409,50 +367,6 @@ document.getElementById('btn').onclick = async () => {
   } catch (e) {
     println("<span style='color:#b00020'><b>Error:</b> " + e.message + "</span>");
   }
-};
-
-// 스트리밍
-document.getElementById('btnStream').onclick = async () => {
-  const question = q.value.trim();
-  if(!question) return;
-  println("<b>You:</b> " + question);
-  q.value = "";
-
-  const r = await fetch("/chat_stream", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({
-      question,
-      session_id: sid.value || "default",
-      system_prompt: sys.value || null,
-      file_id: lastFileId || null
-    })
-  });
-
-  if(!r.ok || !r.body) {
-    const data = await r.json().catch(()=> ({}));
-    println("<span style='color:#b00020'><b>Error:</b> " + (data.detail || r.statusText) + "</span>");
-    return;
-  }
-
-  const reader = r.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let assistantLine = "<span style='color:#1f4c7c'><b>Assistant:</b> ";
-
-  const span = document.createElement("div");
-  span.innerHTML = assistantLine;
-  log.appendChild(span);
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    const chunk = decoder.decode(value, { stream: true });
-    assistantLine += chunk;
-    span.innerHTML = assistantLine.replace(/\\n/g, "<br>");
-    log.scrollTop = log.scrollHeight;
-  }
-
-  span.innerHTML = assistantLine + "</span>";
 };
 
 // 메모리 리셋
