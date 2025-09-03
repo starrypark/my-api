@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict
 import os
 import io
+import re
 from uuid import uuid4
 import base64
 
@@ -18,6 +19,39 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
+
+# --- Agent 도구/메시지/유틸 ---
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from pydantic import Field
+import datetime, math, ast, time, logging, json
+
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger("agent")
+
+
+# =============================
+# 2) FastAPI
+# =============================
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://jaeminbag12.shinyapps.io",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3838",   # Shiny 로컬 (RStudio 기본 포트)
+        "http://localhost:3838",
+        "http://127.0.0.1:7173",   # Shiny 로컬 (RStudio 기본 포트)
+        "http://localhost:7173",
+    ],
+    allow_credentials=False,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # ---------- PDF ----------
 try:
@@ -48,36 +82,250 @@ if not OPENAI_API_KEY:
         "api_key.txt 파일을 만들거나, .env/환경변수에 추가하세요."
     )
 
+# =============================
+# X) Tools (Agent가 필요 시 자동 사용)
+# =============================
+
+# (1) 안전 계산기 ---------------------------------------------------------
+_ALLOWED_FUNCS = {
+    "abs": abs, "round": round, "sqrt": math.sqrt, "log": math.log, "exp": math.exp,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan, "asin": math.asin, "acos": math.acos,
+    "atan": math.atan, "pow": pow
+}
+_ALLOWED_NAMES = {**_ALLOWED_FUNCS, "pi": math.pi, "e": math.e}
+
+def _safe_eval(expr: str) -> float:
+    # ^를 **로 치환 (수학 표기 지원)
+    expr = expr.replace("^", "**")
+    # AST 파싱 및 화이트리스트 검증
+    node = ast.parse(expr, mode="eval")
+    allowed_nodes = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Load, ast.Call,
+        ast.Name, ast.Pow, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
+        ast.USub, ast.UAdd, ast.Constant
+    )
+    for sub in ast.walk(node):
+        if not isinstance(sub, allowed_nodes):
+            raise ValueError("unsupported expression")
+        if isinstance(sub, ast.Call):
+            if not isinstance(sub.func, ast.Name) or sub.func.id not in _ALLOWED_FUNCS:
+                raise ValueError("unsupported function")
+        if isinstance(sub, ast.Name) and sub.id not in _ALLOWED_NAMES:
+            raise ValueError("unsupported identifier")
+    return eval(compile(node, "<expr>", "eval"), {"__builtins__": {}}, _ALLOWED_NAMES)
+
+class CalcInput(BaseModel):
+    expression: str = Field(..., description="예: 2*(3+4)/sqrt(2)")
+
+@tool("calc", args_schema=CalcInput)
+def calc_tool(expression: str) -> str:
+    """수식 계산이 필요할 때 사용."""
+    try:
+        return str(_safe_eval(expression))
+    except Exception as e:
+        return f"[calc error] {e}"
+
+# (2) 업로드 PDF 간단 검색 -----------------------------------------------
+class PDFSearchInput(BaseModel):
+    query: str = Field(..., description="키워드 또는 짧은 문장")
+
+@tool("search_pdf", args_schema=PDFSearchInput)
+def search_pdf_tool(query: str) -> str:
+    """업로드한 PDF 텍스트에서 키워드 주변 스니펫을 찾아 반환."""
+    q = query.lower()
+    hits = []
+    for fid, rec in _FILE_STORE.items():
+        if rec.get("content_type") == "application/pdf" and rec.get("text"):
+            text = rec["text"]
+            low = text.lower()
+            idx = low.find(q)
+            if idx >= 0:
+                s = max(0, idx - 160)
+                e = min(len(text), idx + len(q) + 160)
+                snippet = text[s:e].replace("\n", " ")
+                hits.append(f"[{rec['filename']} | id={fid}] …{snippet}…")
+    return "\n".join(hits[:5]) if hits else "검색 결과 없음"
+
+# (3) 현재 시각 ----------------------------------------------------------
+@tool("now")
+def now_tool() -> str:
+    """현재 서버 시각을 문자열로 반환."""
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# (4) 모의 생존 확률 계산기 -----------------------------------------------
+class MockSurvivalInput(BaseModel):
+    text: str = Field(..., description="질문/환자 설명 전체 문장")
+
+def _roman_to_int(s: str) -> Optional[int]:
+    if not s: return None
+    s = s.upper().strip()
+    return {"I":1, "II":2, "III":3, "IV":4}.get(s)
+
+# 추출 결과 스키마 정의
+class SurvivalFields(BaseModel):
+    age: Optional[int] = Field(None, description="나이")
+    sex: Optional[int] = Field(None, description="성별: male=0, female=1")
+    stage: Optional[int] = Field(None, description="SEER stage: 1=Localized, 2=Regional, 3=Distant, 4=Unknown")
+    year: Optional[int] = Field(None, description="n-year survival probability (기간, 달력연도가 아님)")
+
+@tool("mock_survival", args_schema=MockSurvivalInput)
+def mock_survival_tool(text: str) -> str:
+    """
+    A dedicated tool that calculates simulated survival probabilities from text 
+    containing patient age, sex, SEER stage, and year.
+    You must use this tool exclusively for the calculation. 
+    The output should contain only probability values.
+    (Medical significance: none, demo only.)
+
+    SEER stage coding:
+    Localized = 1
+    Regional = 2
+    Distant = 3
+    Unknown = 4
+
+    sex coding : male = 0, female = 1
+    """
+
+    # LLM에 필드 추출 요청
+    extraction_prompt = f"""
+    Extract survival fields from the text below.
+    Respond strictly in JSON format with keys: age, sex, stage, year.
+    
+    - age: integer
+    - sex: male=0, female=1
+    - stage: 1=Localized, 2=Regional, 3=Distant, 4=Unknown
+    - year: survival duration in years (not calendar year)
+
+    Text: {text}
+    """
+
+    response = llm.invoke([HumanMessage(content=extraction_prompt)])
+    try:
+        parsed = SurvivalFields.parse_raw(response.content)
+    except Exception:
+        # LLM이 JSON을 못 주면 fallback
+        return "probability=N/A"
+
+    age = parsed.age or 0
+    stage = parsed.stage or 0
+    sex = parsed.sex or 0
+    year = parsed.year or 0
+
+    prob = (age + stage + sex + year) / 100
+    return f"{prob:.3f}"
+    
+# Tool 정의
+TOOLS = [calc_tool, search_pdf_tool, now_tool, mock_survival_tool]
 
 # =============================
-# 2) FastAPI
+# X) Agent 실행 함수 (tool-calling)
 # =============================
-app = FastAPI()
+def run_agent(question: str, system_prompt: str, session_id: str, file_context: str = "", debug: bool = False):
+    hist = get_session_history(session_id)
+    llm_tools = llm.bind_tools(TOOLS)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://jaeminbag12.shinyapps.io",
-        "http://127.0.0.1:8000",
-        "http://localhost:8000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3000",
-        "http://127.0.0.1:3838",   # Shiny 로컬 (RStudio 기본 포트)
-        "http://localhost:3838",
-        "http://127.0.0.1:7173",   # Shiny 로컬 (RStudio 기본 포트)
-        "http://localhost:7173",
-    ],
-    allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["*"],
-)
+    # 디버그용 트레이스 버퍼
+    trace = {
+        "session_id": session_id,
+        "question": question,
+        "tool_calls": [],   # 각 툴 호출 기록
+        "rounds": 0,        # 모델-툴 왕복 라운드 수
+    }
+
+    def _truncate(obj, n=500):
+        try:
+            s = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False, default=str)
+        except Exception:
+            s = str(obj)
+        return s if len(s) <= n else s[:n] + "...<truncated>"
+        
+    def _sanitize_preview(tool_name: str, result: str) -> str:
+        if tool_name == "mock_survival":
+            try:
+                m = re.search(r'(-?\d+(?:\.\d+)?)', str(result))
+                if m:
+                    return f"probability={m.group(1)}"
+                else:
+                    return "probability=N/A"
+            except Exception:
+                return "probability=N/A"
+        return str(result)
+
+
+    messages = [SystemMessage(content=system_prompt)]
+    messages.extend(hist.messages)
+    messages.append(HumanMessage(content=question + file_context))
+
+    t0 = time.time()
+    ai = llm_tools.invoke(messages)
+    tool_calls = getattr(ai, "tool_calls", []) or []
+
+    while tool_calls:
+        trace["rounds"] += 1
+        tool_msgs = []
+        for tc in tool_calls:
+            name = tc.get("name")
+            args = tc.get("args", {})
+            call_id = tc.get("id")
+
+            start = time.time()
+            try:
+                tool_fn = next((t for t in TOOLS if t.name == name), None)
+                if not tool_fn:
+                    result = f"[unknown tool: {name}]"
+                else:
+                    result = tool_fn.invoke(args)
+                ok = True
+            except Exception as e:
+                result = f"[tool error] {e}"
+                ok = False
+            dur = time.time() - start
+
+            # 로그 & 트레이스 기록
+            preview = _sanitize_preview(name, result)
+            LOGGER.info(f"[AGENT] tool={name} ok={ok} dur={dur:.3f}s args={args} result={_truncate(preview, 200)}")
+            trace["tool_calls"].append({
+                "tool": name,
+                "ok": ok,
+                "duration_s": round(dur, 3),
+                "args": args,  # 필요하면 args도 마스킹 가능
+                "result_preview": _truncate(preview, 500),
+            })
+
+            tool_msgs.append(ToolMessage(content=str(result), name=name, tool_call_id=call_id))
+
+        messages.append(ai)
+        messages.extend(tool_msgs)
+        ai = llm_tools.invoke(messages)
+        tool_calls = getattr(ai, "tool_calls", []) or []
+
+    total = time.time() - t0
+
+    # 히스토리 업데이트
+    hist.add_user_message(question + file_context)
+    hist.add_ai_message(ai.content or "")
+
+    # 마지막 요약 로그
+    LOGGER.info(f"[AGENT] answer_len={len(ai.content or '')} rounds={trace['rounds']} total={total:.3f}s")
+
+    if debug:
+        trace["answer_preview"] = _truncate(ai.content or "", 800)
+        trace["total_duration_s"] = round(total, 3)
+        return (ai.content or ""), trace
+    else:
+        return (ai.content or ""), None
+
 
 # =============================
 # 3) LLM & 체인
 # =============================
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-5", temperature=0)
 
-DEFAULT_SYSTEM = "You are a helpful assistant. Keep answers concise and accurate."
+DEFAULT_SYSTEM = (
+    "You are a helpful assistant. Keep answers concise and accurate. "
+    "Use tools only when they help answer better (e.g., math calculation, searching uploaded PDFs, getting current time). "
+    "If tools are not needed, answer directly."
+)
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", "{system_prompt}"),
@@ -117,6 +365,7 @@ class ChatIn(BaseModel):
     session_id: Optional[str] = "default"
     system_prompt: Optional[str] = None
     file_id: Optional[str] = None  # 업로드 파일 참조용
+    debug: Optional[bool] = False
 
 # =============================
 # 6) 헬스체크/에코
@@ -213,12 +462,13 @@ def chat(body: ChatIn):
             elif rec["bytes"] is not None:
                 file_context = f"\n\n[Attached image: {rec['filename']} ({rec['content_type']}, {rec['size']} bytes)]"
 
-        text = chain_with_memory.invoke(
-            {"question": body.question + file_context, "system_prompt": system_prompt},
-            config={"configurable": {"session_id": session_id}},
-        )
-        return {"answer": text}
-
+        answer, trace = run_agent(
+          body.question, system_prompt, session_id, file_context=file_context, debug=bool(body.debug)
+)
+        resp = {"answer": answer}
+        if trace is not None:
+            resp["debug"] = trace
+        return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -270,6 +520,9 @@ def reset_memory(body: ChatIn):
     if sid in _SESSION_STORES:
         del _SESSION_STORES[sid]
     return {"ok": True, "session_id": sid, "message": "memory cleared"}
+
+
+
 
 # =============================
 # 12) 샘플 홈 UI (업로드 포함)
@@ -346,11 +599,11 @@ document.getElementById('btnUpload').onclick = async () => {
 // 비스트리밍
 document.getElementById('btn').onclick = async () => {
   const question = q.value.trim();
-  if(!question) return;
+  if (!question) return;
   println("<b>You:</b> " + question);
   q.value = "";
 
-  try {
+  try {  // ✅ try 복구
     const r = await fetch("/chat", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
@@ -358,12 +611,32 @@ document.getElementById('btn').onclick = async () => {
         question,
         session_id: sid.value || "default",
         system_prompt: sys.value || null,
-        file_id: lastFileId || null
+        file_id: lastFileId || null,
+        debug: true                    // ✅ 툴 콜링 트레이스 요청
       })
     });
     const data = await r.json();
-    if(!r.ok) throw new Error(data.detail || r.statusText);
+    if (!r.ok) throw new Error(data.detail || r.statusText);
+
+    // 답변 출력
     println("<span style='color:#1f4c7c'><b>Assistant:</b> " + (data.answer || "") + "</span>");
+
+    // ✅ 툴 사용 뱃지/요약 표시
+    if (data.debug && Array.isArray(data.debug.tool_calls)) {
+      const used = data.debug.tool_calls.map(t => t.tool).filter(Boolean);
+      const info = used.length ? used.join(", ") : "none";
+      const rounds = data.debug.rounds ?? 0;
+      const total = data.debug.total_duration_s ?? "?";
+      println(
+        `<div style="color:#666;font-size:12px;margin:-6px 0 8px 0">
+           ↳ tools used: ${info} · rounds: ${rounds} · total: ${total}s
+         </div>`
+      );
+
+      // (선택) 상세 내역 펼쳐보기
+      // println("<pre style='background:#f7f7f7;border:1px dashed #ccc;padding:6px;font-size:12px'>"
+      //   + JSON.stringify(data.debug.tool_calls, null, 2) + "</pre>");
+    }
   } catch (e) {
     println("<span style='color:#b00020'><b>Error:</b> " + e.message + "</span>");
   }
