@@ -319,7 +319,7 @@ def run_agent(question: str, system_prompt: str, session_id: str, file_context: 
 # =============================
 # 3) LLM & 체인
 # =============================
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-4.1", temperature=0)
 
 DEFAULT_SYSTEM = (
     "You are a helpful assistant. Keep answers concise and accurate. "
